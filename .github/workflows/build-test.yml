@@ -1,0 +1,60 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [master]
+  merge_group:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4.1.0
+        with:
+          dotnet-version: |
+            10.0.x
+            8.0.x
+
+      - name: Install Mono
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mono-complete
+          mono --version
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          dotnet --info
+          dotnet build
+          dotnet test -f net10.0 --logger "trx" --results-directory artifacts/test-results/net10.0
+          dotnet test -f net8.0 --logger "trx" --results-directory artifacts/test-results/net8.0
+          dotnet test -f net47 --logger "trx" --results-directory artifacts/test-results/net47
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: artifacts/test-results
+          if-no-files-found: warn
+          retention-days: 7
