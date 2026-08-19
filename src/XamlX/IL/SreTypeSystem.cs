@@ -327,28 +327,50 @@ namespace XamlX.IL
 
         class SreCustomAttribute : IXamlCustomAttribute
         {
+            private readonly SreTypeSystem _system;
             private readonly CustomAttributeData _data;
+            private List<object?>? _parameters;
+            private Dictionary<string, object?>? _properties;
 
             [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TrimmingMessages.CanBeSafelyTrimmed)]
             public SreCustomAttribute(SreTypeSystem system, CustomAttributeData data, IXamlType type)
             {
+                _system = system;
                 Type = type;
                 _data = data;
-                object? ConvertAttributeValue(object? value)
+            }
+
+            [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TrimmingMessages.CanBeSafelyTrimmed)]
+            private object? ConvertAttributeValue(object? value)
+            {
+                if (value is Type t)
+                    return _system.ResolveType(t);
+                if (value is CustomAttributeTypedArgument attr)
+                    return attr.Value;
+                if (value is IEnumerable<CustomAttributeTypedArgument> array)
+                    return array.Select(a => ConvertAttributeValue(a)).ToArray();
+                return value;
+            }
+
+            private List<object?> GetParameters()
+            {
+                var arguments = _data.ConstructorArguments;
+                var parameters = new List<object?>(arguments.Count);
+                for (var i = 0; i < arguments.Count; i++)
+                    parameters.Add(ConvertAttributeValue(arguments[i].Value));
+                return parameters;
+            }
+
+            private Dictionary<string, object?> GetProperties()
+            {
+                var arguments = _data.NamedArguments;
+                var properties = new Dictionary<string, object?>(arguments.Count);
+                for (var i = 0; i < arguments.Count; i++)
                 {
-                    if (value is Type t)
-                        return system.ResolveType(t);
-                    if (value is CustomAttributeTypedArgument attr)
-                        return attr.Value;
-                    if (value is IEnumerable<CustomAttributeTypedArgument> array)
-                        return array.Select(a => ConvertAttributeValue(a)).ToArray();
-                    return value;
+                    var argument = arguments[i];
+                    properties.Add(argument.MemberName, ConvertAttributeValue(argument.TypedValue.Value));
                 }
-                Parameters = data.ConstructorArguments.Select(p =>
-                    ConvertAttributeValue(p.Value)).ToList();
-                Properties = data.NamedArguments?.ToDictionary(x => x.MemberName,
-                                 x => ConvertAttributeValue(x.TypedValue.Value)) ??
-                             new Dictionary<string, object?>();
+                return properties;
             }
 
             public bool Equals(IXamlCustomAttribute? other)
@@ -357,8 +379,8 @@ namespace XamlX.IL
             }
 
             public IXamlType Type { get; }
-            public List<object?> Parameters { get; }
-            public Dictionary<string, object?> Properties { get; }
+            public List<object?> Parameters => _parameters ??= GetParameters();
+            public Dictionary<string, object?> Properties => _properties ??= GetProperties();
         }
 
         [DebuggerDisplay("{_parameterInfo}")]
@@ -366,6 +388,8 @@ namespace XamlX.IL
         {
             private readonly SreTypeSystem _system;
             private readonly ParameterInfo _parameterInfo;
+            private IXamlType? _parameterType;
+            private IReadOnlyList<IXamlCustomAttribute>? _customAttributes;
 
             public SreXamlParameterInfo(SreTypeSystem system, ParameterInfo parameterInfo)
             {
@@ -375,10 +399,26 @@ namespace XamlX.IL
 
             public string Name => _parameterInfo.Name ?? string.Empty;
             [UnconditionalSuppressMessage("Trimming", "IL2072", Justification = TrimmingMessages.TypePreservedElsewhere)]
-            public IXamlType ParameterType => _system.ResolveType(_parameterInfo.ParameterType);
+            public IXamlType ParameterType => _parameterType ??= _system.ResolveType(_parameterInfo.ParameterType);
             [UnconditionalSuppressMessage("Trimming", "IL2072", Justification = TrimmingMessages.TypePreservedElsewhere)]
-            public IReadOnlyList<IXamlCustomAttribute> CustomAttributes => _parameterInfo.GetCustomAttributesData()
-                .Select(a => new SreCustomAttribute(_system, a, _system.ResolveType(a.AttributeType))).ToList();
+            public IReadOnlyList<IXamlCustomAttribute> CustomAttributes => _customAttributes ??= GetCustomAttributes();
+
+            [UnconditionalSuppressMessage("Trimming", "IL2072", Justification = TrimmingMessages.TypePreservedElsewhere)]
+            private IReadOnlyList<IXamlCustomAttribute> GetCustomAttributes()
+            {
+                var attributes = _parameterInfo.GetCustomAttributesData();
+                if (attributes.Count == 0)
+                    return Array.Empty<IXamlCustomAttribute>();
+
+                var result = new IXamlCustomAttribute[attributes.Count];
+                for (var i = 0; i < attributes.Count; i++)
+                {
+                    var attribute = attributes[i];
+                    result[i] = new SreCustomAttribute(_system, attribute, _system.ResolveType(attribute.AttributeType));
+                }
+
+                return result;
+            }
         }
         
         [DebuggerDisplay("{_method}")]
@@ -386,6 +426,7 @@ namespace XamlX.IL
         {
             private readonly MethodBase _method;
             private IReadOnlyList<IXamlParameterInfo>? _parameters;
+            private IReadOnlyList<IXamlType>? _parameterTypes;
             private IXamlType? _declaringType;
 
             public SreMethodBase(SreTypeSystem system, MethodBase method) : base(system, method)
@@ -398,10 +439,36 @@ namespace XamlX.IL
             public bool IsStatic => _method.IsStatic;
 
             protected virtual IReadOnlyList<IXamlParameterInfo> SreParameters => _parameters ??=
-                _method.GetParameters().Select(p => new SreXamlParameterInfo(System, p)).ToArray();
+                GetParameters();
 
             public IReadOnlyList<IXamlType> Parameters =>
-                SreParameters.Select(p => p.ParameterType).ToList();
+                _parameterTypes ??= GetParameterTypes();
+
+            private IReadOnlyList<IXamlParameterInfo> GetParameters()
+            {
+                var parameters = _method.GetParameters();
+                if (parameters.Length == 0)
+                    return Array.Empty<IXamlParameterInfo>();
+
+                var result = new IXamlParameterInfo[parameters.Length];
+                for (var i = 0; i < parameters.Length; i++)
+                    result[i] = new SreXamlParameterInfo(System, parameters[i]);
+
+                return result;
+            }
+
+            private IReadOnlyList<IXamlType> GetParameterTypes()
+            {
+                var parameters = SreParameters;
+                if (parameters.Count == 0)
+                    return Array.Empty<IXamlType>();
+
+                var result = new IXamlType[parameters.Count];
+                for (var i = 0; i < parameters.Count; i++)
+                    result[i] = parameters[i].ParameterType;
+
+                return result;
+            }
 
             [UnconditionalSuppressMessage("Trimming", "IL2072", Justification = TrimmingMessages.TypePreservedElsewhere)]
             public IXamlType DeclaringType
@@ -419,6 +486,7 @@ namespace XamlX.IL
             private readonly SreTypeSystem _system;
             private IReadOnlyList<IXamlType>? _genericParameters;
             private IReadOnlyList<IXamlType>? _genericArguments;
+            private IXamlType? _returnType;
 
             public SreMethod(SreTypeSystem system, MethodInfo method) : base(system, method)
             {
@@ -439,7 +507,7 @@ namespace XamlX.IL
             }
 
             [UnconditionalSuppressMessage("Trimming", "IL2072", Justification = TrimmingMessages.TypePreservedElsewhere)]
-            public IXamlType ReturnType => _system.ResolveType(Method.ReturnType);
+            public IXamlType ReturnType => _returnType ??= _system.ResolveType(Method.ReturnType);
 
 
             public bool IsGenericMethod => Method.IsGenericMethod;
@@ -483,6 +551,7 @@ namespace XamlX.IL
         {
             private IReadOnlyList<IXamlType>? _parameters;
             private IXamlType? _declaringType;
+            private IXamlType? _propertyType;
 
             public PropertyInfo Member { get; }
 
@@ -501,7 +570,7 @@ namespace XamlX.IL
             }
 
             [UnconditionalSuppressMessage("Trimming", "IL2072", Justification = TrimmingMessages.TypePreservedElsewhere)]
-            public IXamlType PropertyType => System.ResolveType(Member.PropertyType);
+            public IXamlType PropertyType => _propertyType ??= System.ResolveType(Member.PropertyType);
             public IXamlMethod? Setter { get; }
             public IXamlMethod? Getter { get; }
 
@@ -772,7 +841,18 @@ namespace XamlX.IL
                 {
                     MethodBuilder = methodBuilder;
                     Generator = new IlGen(system, methodBuilder.GetILGenerator());
-                    _parameters = parameters.Select((p, i) => new AnonymousParameterInfo(p, i)).ToArray();
+                    if (parameters.Count == 0)
+                    {
+                        _parameters = Array.Empty<IXamlParameterInfo>();
+                    }
+                    else
+                    {
+                        var parameterInfos = new IXamlParameterInfo[parameters.Count];
+                        for (var i = 0; i < parameters.Count; i++)
+                            parameterInfos[i] = new AnonymousParameterInfo(parameters[i], i);
+
+                        _parameters = parameterInfos;
+                    }
                 }
 
                 protected override IReadOnlyList<IXamlParameterInfo> SreParameters => _parameters;
@@ -806,9 +886,38 @@ namespace XamlX.IL
                     attrs |= MethodAttributes.NewSlot | MethodAttributes.Virtual;
 
                 var ret = ((SreType) returnType).Type;
-                var largs = args.ToList();
-                var argTypes = largs.Cast<SreType>().Select(t => t.Type);
-                var m = _tb.DefineMethod(name, attrs, ret, argTypes.ToArray());
+                IReadOnlyList<IXamlType> largs;
+                Type[] argTypes;
+
+                if (args is IReadOnlyList<IXamlType> argList)
+                {
+                    largs = argList;
+                    if (argList.Count == 0)
+                    {
+                        argTypes = Type.EmptyTypes;
+                    }
+                    else
+                    {
+                        argTypes = new Type[argList.Count];
+                        for (var i = 0; i < argList.Count; i++)
+                            argTypes[i] = ((SreType)argList[i]).Type;
+                    }
+                }
+                else
+                {
+                    var xamlArgs = new List<IXamlType>();
+                    var typeArgs = new List<Type>();
+                    foreach (var arg in args)
+                    {
+                        xamlArgs.Add(arg);
+                        typeArgs.Add(((SreType)arg).Type);
+                    }
+
+                    largs = xamlArgs;
+                    argTypes = typeArgs.Count == 0 ? Type.EmptyTypes : typeArgs.ToArray();
+                }
+
+                var m = _tb.DefineMethod(name, attrs, ret, argTypes);
                 if (overrideMethod != null)
                     _tb.DefineMethodOverride(m, ((SreMethod)overrideMethod).Method);
 
